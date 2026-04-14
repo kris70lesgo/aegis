@@ -1,0 +1,69 @@
+@import "tailwindcss";
+
+:root {
+    --background: #000008;
+    --foreground: #cbd5e1;
+    --accent: #22d3ee;
+}
+
+@theme inline {
+    --color-background: var(--background);
+    --color-foreground: var(--foreground);
+    --font-sans: var(--font-geist-sans);
+    --font-mono: var(--font-geist-mono);
+}
+
+/* Force full viewport coverage — no scrollbars, no overflow */
+html,
+body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: #000008;
+}
+
+body {
+    color: var(--foreground);
+    font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* Next.js root div must also fill the viewport */
+#__next,
+[data-nextjs-scroll-focus-boundary] {
+    width: 100%;
+    height: 100%;
+}
+
+/* Subtle scanline overlay for ops-center feel */
+body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0, 60, 120, 0.012) 2px,
+        rgba(0, 60, 120, 0.012) 4px
+    );
+    pointer-events: none;
+    z-index: 9999;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+    width: 4px;
+}
+::-webkit-scrollbar-track {
+    background: #020c18;
+}
+::-webkit-scrollbar-thumb {
+    background: #0f3460;
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #1a5ca8;
+}
