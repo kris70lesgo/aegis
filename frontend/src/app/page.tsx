@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { GlobeView } from "./components/GlobeView";
 
 const API = "http://127.0.0.1:8000";
@@ -359,16 +359,19 @@ export default function Home() {
     setShowConjPanel(false);
   }, []);
 
-  const handleSelectFromSearch = (sat: Satellite) => {
+  const handleSelectFromSearch = useCallback((sat: Satellite) => {
     setSelected(sat);
     setShowSatPanel(true);
     setShowSearch(false);
     setSearch("");
-  };
+  }, []);
 
   // ── Derived ───────────────────────────────────────────────────────────────
 
-  const highCount = conjunctions.filter((c) => c.risk === "HIGH").length;
+  const highCount = useMemo(
+    () => conjunctions.filter((c) => c.risk === "HIGH").length,
+    [conjunctions],
+  );
   const totalSats = sysStatus?.satellites ?? 0;
 
   // ── Render ────────────────────────────────────────────────────────────────

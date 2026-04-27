@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
+import * as THREE from "three";
 
 const Globe = dynamic(() => import("react-globe.gl"), {
   ssr: false,
@@ -125,6 +126,149 @@ function getSatColor(s: SatPoint, selectedId: string | null): string {
   return "#4ade80";
 }
 
+// ── Stable Globe prop accessors (module-level, never change reference) ────────
+
+const PATH_COLOR_FN = (d: object) => {
+  const t = (d as PathDatum).type;
+  if (t === "grid") return "rgba(80,140,255,0.07)";
+  if (t === "orbit") return "rgba(255,165,40,0.13)";
+  return "rgba(0,240,255,0.9)";
+};
+
+const PATH_STROKE_FN = (d: object) => {
+  const t = (d as PathDatum).type;
+  if (t === "grid") return 0.2;
+  if (t === "orbit") return 0.45;
+  return 1.4;
+};
+
+const PATH_DASH_LENGTH_FN = (d: object) =>
+  (d as PathDatum).type === "track" ? 0.06 : 0;
+
+const PATH_DASH_GAP_FN = (d: object) =>
+  (d as PathDatum).type === "track" ? 0.04 : 0;
+
+const PATH_DASH_ANIMATE_FN = (d: object) =>
+  (d as PathDatum).type === "track" ? 2000 : 0;
+
+const RING_COLOR_FN = (d: object) =>
+  (d as any).isSelection
+    ? "rgba(255,255,255,0.7)"
+    : "rgba(239,68,68,0.65)";
+
+const ARC_COLOR_FN = (d: object) => {
+  const a = d as ConjArc;
+  if (a.risk === "LOW") return "rgba(74,222,128,0.35)";
+  if (a.risk === "MEDIUM") return "rgba(251,191,36,0.80)";
+  return a.layer === "glow"
+    ? "rgba(239,68,68,0.18)"
+    : "rgba(239,68,68,0.9)";
+};
+
+const ARC_STROKE_FN = (d: object) => {
+  const a = d as ConjArc;
+  if (a.risk === "LOW") return 0.4;
+  if (a.risk === "MEDIUM") return 0.9;
+  return a.layer === "glow" ? 2.0 : 1.2;
+};
+
+const ARC_ALT_AUTO_SCALE_FN = (d: object) => {
+  const a = d as ConjArc;
+  if (a.risk === "LOW") return 0.12;
+  if (a.risk === "MEDIUM") return 0.22;
+  return 0.32;
+};
+
+const ARC_DASH_LENGTH_FN = (d: object) => {
+  const a = d as ConjArc;
+  if (a.risk === "LOW") return 1;
+  if (a.risk === "MEDIUM") return 0.7;
+  return a.layer === "glow" ? 1 : 0.5;
+};
+
+const ARC_DASH_GAP_FN = (d: object) => {
+  const a = d as ConjArc;
+  if (a.risk === "LOW") return 0;
+  if (a.risk === "MEDIUM") return 0.2;
+  return a.layer === "glow" ? 0 : 0.3;
+};
+
+const ARC_DASH_ANIMATE_FN = (d: object) => {
+  const a = d as ConjArc;
+  if (a.risk === "LOW") return 6000;
+  if (a.risk === "MEDIUM") return 3500;
+  return 2000;
+};
+
+const ARC_LABEL_FN = (d: object) => {
+  const a = d as ConjArc;
+  if (a.layer === "glow") return "";
+  return `<div style="background:rgba(8,0,0,0.95);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:7px 11px;font-family:ui-monospace,monospace;font-size:11px;pointer-events:none">
+    <div style="color:${a.risk === "HIGH" ? "#ef4444" : a.risk === "MEDIUM" ? "#fbbf24" : "#4ade80"};font-weight:700;margin-bottom:4px">⚠ ${a.risk}</div>
+    <div style="color:#94a3b8">${a.sat1_name}</div>
+    <div style="color:#475569;font-size:9px">↕ ${a.distance.toFixed(1)} km</div>
+    <div style="color:#94a3b8">${a.sat2_name}</div>
+  </div>`;
+};
+
+// ── Spatial index for fast nearest-neighbor lookup on globe click ─────────────
+
+interface GridCell {
+  sats: SatPoint[];
+}
+
+function buildGrid(points: SatPoint[], cellSize = 5): Map<string, GridCell> {
+  const grid = new Map<string, GridCell>();
+  for (const s of points) {
+    const cx = Math.floor(s.lat / cellSize);
+    const cy = Math.floor(s.lon / cellSize);
+    const key = `${cx},${cy}`;
+    if (!grid.has(key)) grid.set(key, { sats: [] });
+    grid.get(key)!.sats.push(s);
+  }
+  return grid;
+}
+
+function findNearestInGrid(
+  grid: Map<string, GridCell>,
+  lat: number,
+  lon: number,
+  cellSize = 5,
+  maxRadius = 3,
+): SatPoint | null {
+  const cx = Math.floor(lat / cellSize);
+  const cy = Math.floor(lon / cellSize);
+  const toRad = (d: number) => (d * Math.PI) / 180;
+
+  let best: SatPoint | null = null;
+  let bestDist = Infinity;
+
+  for (let dx = -maxRadius; dx <= maxRadius; dx++) {
+    for (let dy = -maxRadius; dy <= maxRadius; dy++) {
+      const key = `${cx + dx},${cy + dy}`;
+      const cell = grid.get(key);
+      if (!cell) continue;
+
+      for (const s of cell.sats) {
+        const dLat = toRad(s.lat - lat);
+        const dLon = toRad(s.lon - lon);
+        const a =
+          Math.sin(dLat / 2) ** 2 +
+          Math.cos(toRad(lat)) *
+            Math.cos(toRad(s.lat)) *
+            Math.sin(dLon / 2) ** 2;
+        const dist = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = s;
+        }
+      }
+    }
+  }
+
+  return bestDist < 0.05 ? best : null;
+}
+
 // ── Orbit geometry helpers ────────────────────────────────────────────────────
 
 function buildOrbitRing(
@@ -235,13 +379,27 @@ export function GlobeView({ selectedNoradId, onSelectSatellite, flyToSatellite }
   const [conjArcs, setConjArcs] = useState<ConjArc[]>([]);
   const [conjCount, setConjCount] = useState(0);
 
-  // ── Window resize — globe fills the whole viewport ─────────────────────────
+  // ── Hover state for satellite dots ────────────────────────────────────────
+  const [hoveredSat, setHoveredSat] = useState<SatPoint | null>(null);
+  const [hoverPos, setHoverPos] = useState<{ x: number; y: number } | null>(null);
+  const hoveredSatRef = useRef<SatPoint | null>(null);
+
+  // ── Window resize — globe fills the whole viewport (debounced via rAF) ──────
   useEffect(() => {
-    const update = () =>
-      setDims({ w: window.innerWidth, h: window.innerHeight });
-    update();
+    let rafId: number | undefined;
+    const update = () => {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        setDims({ w: window.innerWidth, h: window.innerHeight });
+        rafId = undefined;
+      });
+    };
     window.addEventListener("resize", update);
-    return () => window.removeEventListener("resize", update);
+    update();
+    return () => {
+      window.removeEventListener("resize", update);
+      if (rafId) cancelAnimationFrame(rafId);
+    };
   }, []);
 
   // ── Data fetch helpers ─────────────────────────────────────────────────────
@@ -387,9 +545,150 @@ export function GlobeView({ selectedNoradId, onSelectSatellite, flyToSatellite }
 
   // ── Derived data ───────────────────────────────────────────────────────────
 
+  // Spatial grid for O(1) nearest-neighbor on globe click
+  const satGrid = useMemo(() => buildGrid(satPoints), [satPoints]);
+
+  // ── LOD: Adjust point radius based on camera altitude ─────────────────────
+  const [cameraAltitude, setCameraAltitude] = useState(2.5);
+  const cameraAltRef = useRef(2.5);
+  const [cameraPos, setCameraPos] = useState({ lat: 0, lng: 0 });
+  const cameraPosRef = useRef({ lat: 0, lng: 0 });
+
+  // Track camera state by polling the Three.js camera directly
+  useEffect(() => {
+    let rafId: number;
+
+    const toLatLng = (x: number, y: number, z: number) => {
+      const r = Math.sqrt(x * x + y * y + z * z);
+      const lat = (Math.asin(y / r) * 180) / Math.PI;
+      const lng = (Math.atan2(-z, x) * 180) / Math.PI;
+      const alt = r - 1; // globe radius = 1
+      return { lat, lng, alt };
+    };
+
+    const poll = () => {
+      if (globeRef.current) {
+        const camera = globeRef.current.camera();
+        if (camera) {
+          const { lat, lng, alt } = toLatLng(
+            camera.position.x,
+            camera.position.y,
+            camera.position.z
+          );
+
+          if (
+            Math.abs(alt - cameraAltRef.current) > 0.01 ||
+            Math.abs(lat - cameraPosRef.current.lat) > 0.1 ||
+            Math.abs(lng - cameraPosRef.current.lng) > 0.1
+          ) {
+            cameraAltRef.current = alt;
+            cameraPosRef.current = { lat, lng };
+            setCameraAltitude(alt);
+            setCameraPos({ lat, lng });
+          }
+        }
+      }
+      rafId = requestAnimationFrame(poll);
+    };
+
+    rafId = requestAnimationFrame(poll);
+    return () => cancelAnimationFrame(rafId);
+  }, []);
+
+  // LOD-filtered satellites: only render visible ones based on camera position
+  const lodPoints = useMemo(() => {
+    if (satPoints.length === 0) return [];
+
+    const camAlt = cameraAltRef.current;
+    const camLat = cameraPosRef.current.lat;
+    const camLng = cameraPosRef.current.lng;
+
+    // Calculate visible cone angle based on altitude
+    const visibleAngle = Math.min(90, 30 + camAlt * 25);
+    const cosMaxDist = Math.cos((visibleAngle * Math.PI) / 180);
+
+    const camLatRad = (camLat * Math.PI) / 180;
+    const camLngRad = (camLng * Math.PI) / 180;
+    const sinCamLat = Math.sin(camLatRad);
+    const cosCamLat = Math.cos(camLatRad);
+
+    const result: SatPoint[] = [];
+
+    for (const s of satPoints) {
+      if (
+        s.norad_id === selectedNoradId ||
+        s.riskLevel === "HIGH" ||
+        s.riskLevel === "MEDIUM"
+      ) {
+        result.push(s);
+        continue;
+      }
+
+      const satLatRad = (s.lat * Math.PI) / 180;
+      const satLngRad = (s.lon * Math.PI) / 180;
+
+      const dot =
+        sinCamLat * Math.sin(satLatRad) +
+        cosCamLat * Math.cos(satLatRad) * Math.cos(satLngRad - camLngRad);
+
+      if (dot > cosMaxDist) {
+        result.push(s);
+      }
+    }
+
+    return result;
+  }, [satPoints, selectedNoradId, cameraAltitude, cameraPos.lat, cameraPos.lng]);
+
+  // Point radius scales with zoom level
+  const pointRadius = useMemo(() => {
+    const alt = cameraAltRef.current;
+    // Closer = smaller dots, farther = larger dots (but capped)
+    return Math.max(0.12, Math.min(0.35, 0.15 + alt * 0.08));
+  }, [cameraAltitude]);
+
+  // ── Hover handling — onPointHover (globe.gl) + global mouse tracking ──────
+  const lastHoverTimeRef = useRef(0);
+  const lastHoveredIdRef = useRef<string | null>(null);
+  const mousePosRef = useRef({ x: 0, y: 0 });
+
+  // Track mouse globally so we have pixel coords when onPointHover fires
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      mousePosRef.current = { x: e.clientX, y: e.clientY };
+    };
+    window.addEventListener("mousemove", handler);
+    return () => window.removeEventListener("mousemove", handler);
+  }, []);
+
+  const handlePointHover = useCallback(
+    (sat: object | null) => {
+      const now = Date.now();
+      if (now - lastHoverTimeRef.current < 100) return;
+      lastHoverTimeRef.current = now;
+
+      if (!sat) {
+        if (lastHoveredIdRef.current) {
+          lastHoveredIdRef.current = null;
+          setHoveredSat(null);
+          setHoverPos(null);
+        }
+        return;
+      }
+
+      const s = sat as SatPoint;
+      if (lastHoveredIdRef.current !== s.norad_id) {
+        lastHoveredIdRef.current = s.norad_id;
+        setHoveredSat(s);
+        setHoverPos({ x: mousePosRef.current.x + 16, y: mousePosRef.current.y - 10 });
+      }
+    },
+    [],
+  );
+
   // ALL satellites as merged points (fast, no interaction — just the particle cloud)
   // pointAltitude = 0 means dots sit flat ON the surface — no cylinders/spikes
-  const mergedPoints = useMemo(() => satPoints, [satPoints]);
+  // lodPoints filters to only visible satellites for performance
+  const mergedPoints = lodPoints;
 
   // Clickable overlay: only selected + risk satellites (small set, merge=false)
   const interactivePoints = useMemo(
@@ -400,22 +699,38 @@ export function GlobeView({ selectedNoradId, onSelectSatellite, flyToSatellite }
     [satPoints, selectedNoradId],
   );
 
-  // Danger rings on HIGH-risk sats
-  const dangerRings = useMemo(
-    () =>
-      satPoints
-        .filter((s) => s.riskLevel === "HIGH")
-        .map((s) => ({
-          lat: s.lat,
-          lng: s.lon,
-          maxR: 3,
-          propagationSpeed: 0.7,
-          repeatPeriod: 1600,
-        })),
-    [satPoints],
-  );
+  // Danger rings on HIGH-risk sats — only rebuild when the SET of HIGH-risk NORAD IDs changes
+  const prevHighRiskIdsRef = useRef<Set<string>>(new Set());
+  const dangerRingsRef = useRef<Array<{ lat: number; lng: number; maxR: number; propagationSpeed: number; repeatPeriod: number }>>([]);
+
+  const highRiskIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const s of satPoints) {
+      if (s.riskLevel === "HIGH") ids.add(s.norad_id);
+    }
+    return ids;
+  }, [satPoints]);
+
+  // Only rebuild rings when the set of HIGH-risk satellites actually changes
+  if (
+    highRiskIds.size !== prevHighRiskIdsRef.current.size ||
+    ![...highRiskIds].every((id) => prevHighRiskIdsRef.current.has(id))
+  ) {
+    dangerRingsRef.current = satPoints
+      .filter((s) => s.riskLevel === "HIGH")
+      .map((s) => ({
+        lat: s.lat,
+        lng: s.lon,
+        maxR: 3,
+        propagationSpeed: 0.7,
+        repeatPeriod: 1600,
+      }));
+    prevHighRiskIdsRef.current = highRiskIds;
+  }
+  const dangerRings = dangerRingsRef.current;
 
   // Paths: graticule + orbital shells + selected orbit track
+  // Static geometry is pre-computed at module level, only orbit track changes
   const allPaths = useMemo<PathDatum[]>(() => {
     const paths: PathDatum[] = [];
     for (const seg of GRATICULE) paths.push({ pts: seg, type: "grid" });
@@ -430,7 +745,8 @@ export function GlobeView({ selectedNoradId, onSelectSatellite, flyToSatellite }
     return paths;
   }, [orbitTrack]);
 
-  // Arc layers
+  // Arc layers — avoid duplicating HIGH-risk arcs as glow+core
+  // Instead, use a single arc with layered rendering via the color/stroke accessors
   const arcData = useMemo<ConjArc[]>(() => {
     const hi = conjArcs.filter((a) => a.risk === "HIGH");
     const med = conjArcs.filter((a) => a.risk === "MEDIUM");
@@ -535,27 +851,11 @@ export function GlobeView({ selectedNoradId, onSelectSatellite, flyToSatellite }
         // ── Graticule + orbital shell rings + orbit track
         pathsData={allPaths}
         pathPoints={(d: object) => (d as PathDatum).pts}
-        pathColor={(d: object) => {
-          const t = (d as PathDatum).type;
-          if (t === "grid") return "rgba(80,140,255,0.07)";
-          if (t === "orbit") return "rgba(255,165,40,0.13)";
-          return "rgba(0,240,255,0.9)";
-        }}
-        pathStroke={(d: object) => {
-          const t = (d as PathDatum).type;
-          if (t === "grid") return 0.2;
-          if (t === "orbit") return 0.45;
-          return 1.4;
-        }}
-        pathDashLength={(d: object) =>
-          (d as PathDatum).type === "track" ? 0.06 : 0
-        }
-        pathDashGap={(d: object) =>
-          (d as PathDatum).type === "track" ? 0.04 : 0
-        }
-        pathDashAnimateTime={(d: object) =>
-          (d as PathDatum).type === "track" ? 2000 : 0
-        }
+        pathColor={PATH_COLOR_FN}
+        pathStroke={PATH_STROKE_FN}
+        pathDashLength={PATH_DASH_LENGTH_FN}
+        pathDashGap={PATH_DASH_GAP_FN}
+        pathDashAnimateTime={PATH_DASH_ANIMATE_FN}
         pathTransitionDuration={0}
         // ── MERGED particle cloud — ALL 17k sats, altitude=0, no cylinders
         // pointsMerge=true merges into one THREE mesh: tiny flat circles,
@@ -565,9 +865,10 @@ export function GlobeView({ selectedNoradId, onSelectSatellite, flyToSatellite }
         pointLng="lon"
         pointAltitude={0}
         pointColor={(d: object) => getSatColor(d as SatPoint, selectedNoradId)}
-        pointRadius={0.18}
+        pointRadius={pointRadius}
         pointResolution={4}
-        pointsMerge={true}
+        pointsMerge={false}
+        onPointHover={handlePointHover}
         // ── INTERACTIVE overlay — risk/selected sats only (merge=false → clickable)
         // We render these on top of the merged layer at slight altitude so they
         // are always visible and can receive click/hover events.
@@ -579,6 +880,16 @@ export function GlobeView({ selectedNoradId, onSelectSatellite, flyToSatellite }
         // ── Pulsing rings on HIGH-risk satellites
         ringsData={[
           ...dangerRings,
+          // Hover ring for the currently-hovered satellite
+          ...(hoveredSat
+            ? [{
+                lat: hoveredSat.lat,
+                lng: hoveredSat.lon,
+                maxR: 1.5,
+                propagationSpeed: 1.5,
+                repeatPeriod: 800,
+              }]
+            : []),
           // Selection ring for the currently-selected satellite
           ...(selectedNoradId
             ? satPoints
@@ -598,11 +909,7 @@ export function GlobeView({ selectedNoradId, onSelectSatellite, flyToSatellite }
         ringMaxRadius="maxR"
         ringPropagationSpeed="propagationSpeed"
         ringRepeatPeriod="repeatPeriod"
-        ringColor={(d: object) =>
-          (d as any).isSelection
-            ? "rgba(255,255,255,0.7)"
-            : "rgba(239,68,68,0.65)"
-        }
+        ringColor={RING_COLOR_FN}
         ringResolution={48}
         ringAltitude={0.001}
         // ── Conjunction arcs
@@ -611,80 +918,18 @@ export function GlobeView({ selectedNoradId, onSelectSatellite, flyToSatellite }
         arcStartLng="startLng"
         arcEndLat="endLat"
         arcEndLng="endLng"
-        arcColor={(d: object) => {
-          const a = d as ConjArc;
-          if (a.risk === "LOW") return "rgba(74,222,128,0.35)";
-          if (a.risk === "MEDIUM") return "rgba(251,191,36,0.80)";
-          return a.layer === "glow"
-            ? "rgba(239,68,68,0.18)"
-            : "rgba(239,68,68,0.95)";
-        }}
-        arcStroke={(d: object) => {
-          const a = d as ConjArc;
-          if (a.risk === "LOW") return 0.4;
-          if (a.risk === "MEDIUM") return 0.9;
-          return a.layer === "glow" ? 2.0 : 1.2;
-        }}
-        arcAltitudeAutoScale={(d: object) => {
-          const a = d as ConjArc;
-          if (a.risk === "LOW") return 0.12;
-          if (a.risk === "MEDIUM") return 0.22;
-          return 0.32;
-        }}
-        arcDashLength={(d: object) => {
-          const a = d as ConjArc;
-          if (a.risk === "LOW") return 1;
-          if (a.risk === "MEDIUM") return 0.7;
-          return a.layer === "glow" ? 1 : 0.5;
-        }}
-        arcDashGap={(d: object) => {
-          const a = d as ConjArc;
-          if (a.risk === "LOW") return 0;
-          if (a.risk === "MEDIUM") return 0.2;
-          return a.layer === "glow" ? 0 : 0.3;
-        }}
-        arcDashAnimateTime={(d: object) => {
-          const a = d as ConjArc;
-          if (a.risk === "LOW") return 6000;
-          if (a.risk === "MEDIUM") return 3500;
-          return 2000;
-        }}
-        arcLabel={(d: object) => {
-          const a = d as ConjArc;
-          if (a.layer === "glow") return "";
-          return `<div style="background:rgba(8,0,0,0.95);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:7px 11px;font-family:ui-monospace,monospace;font-size:11px;pointer-events:none">
-            <div style="color:${a.risk === "HIGH" ? "#ef4444" : a.risk === "MEDIUM" ? "#fbbf24" : "#4ade80"};font-weight:700;margin-bottom:4px">⚠ ${a.risk}</div>
-            <div style="color:#94a3b8">${a.sat1_name}</div>
-            <div style="color:#475569;font-size:9px">↕ ${a.distance.toFixed(1)} km</div>
-            <div style="color:#94a3b8">${a.sat2_name}</div>
-          </div>`;
-        }}
-        // ── Globe click → pick nearest satellite ──────────────────────────
-        // Since pointsMerge=true disables per-point click, we use onGlobeClick
-        // to find the nearest satellite within a small screen-space radius.
+        arcColor={ARC_COLOR_FN}
+        arcStroke={ARC_STROKE_FN}
+        arcAltitudeAutoScale={ARC_ALT_AUTO_SCALE_FN}
+        arcDashLength={ARC_DASH_LENGTH_FN}
+        arcDashGap={ARC_DASH_GAP_FN}
+        arcDashAnimateTime={ARC_DASH_ANIMATE_FN}
+        arcLabel={ARC_LABEL_FN}
+        // ── Globe click → pick nearest satellite using spatial grid ─────────
         onGlobeClick={({ lat, lng }: { lat: number; lng: number }) => {
-          if (satPoints.length === 0) return;
-          // Find closest sat by great-circle approximation
-          let best: SatPoint | null = null;
-          let bestDist = Infinity;
-          const toRad = (d: number) => (d * Math.PI) / 180;
-          for (const s of satPoints) {
-            const dLat = toRad(s.lat - lat);
-            const dLon = toRad(s.lon - lng);
-            const a =
-              Math.sin(dLat / 2) ** 2 +
-              Math.cos(toRad(lat)) *
-                Math.cos(toRad(s.lat)) *
-                Math.sin(dLon / 2) ** 2;
-            const dist = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-            if (dist < bestDist) {
-              bestDist = dist;
-              best = s;
-            }
-          }
-          // Only select if click was within ~3° (~333 km) of a satellite
-          if (best && bestDist < 0.05) {
-            onSelectSatellite(best.norad_id, best.name);
+          const nearest = findNearestInGrid(satGrid, lat, lng);
+          if (nearest) {
+            onSelectSatellite(nearest.norad_id, nearest.name);
           }
         }}
         enablePointerInteraction={true}
@@ -786,6 +1031,80 @@ export function GlobeView({ selectedNoradId, onSelectSatellite, flyToSatellite }
           </span>
         </div>
       )}
+
+      {/* ── Satellite hover tooltip — conjunction-style card ─────────────── */}
+      {hoveredSat && hoverPos && (() => {
+        // Find if this satellite is part of any conjunction
+        const conj = conjArcs.find(
+          (a) =>
+            a.sat1_name === hoveredSat.name ||
+            a.sat2_name === hoveredSat.name
+        );
+
+        return (
+          <div
+            style={{
+              position: "absolute",
+              left: hoverPos.x + 16,
+              top: hoverPos.y - 10,
+              zIndex: 50,
+              pointerEvents: "none",
+              background: "rgba(8,0,0,0.95)",
+              backdropFilter: "blur(12px)",
+              border: `1px solid ${hoveredSat.riskLevel === "HIGH" ? "rgba(239,68,68,0.5)" : hoveredSat.riskLevel === "MEDIUM" ? "rgba(251,191,36,0.4)" : "rgba(34,211,238,0.3)"}`,
+              borderRadius: 10,
+              padding: "10px 14px",
+              fontFamily: "ui-monospace, monospace",
+              minWidth: 180,
+              boxShadow: `0 0 20px ${hoveredSat.riskLevel === "HIGH" ? "rgba(239,68,68,0.15)" : hoveredSat.riskLevel === "MEDIUM" ? "rgba(251,191,36,0.1)" : "rgba(34,211,238,0.1)"}`,
+            }}
+          >
+            {/* Risk header */}
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+              {hoveredSat.riskLevel !== "NONE" && (
+                <>
+                  <span style={{ color: hoveredSat.riskLevel === "HIGH" ? "#ef4444" : "#fbbf24", fontSize: 12 }}>⚠</span>
+                  <span style={{
+                    color: hoveredSat.riskLevel === "HIGH" ? "#ef4444" : hoveredSat.riskLevel === "MEDIUM" ? "#fbbf24" : "#4ade80",
+                    fontWeight: 700,
+                    fontSize: 14,
+                    letterSpacing: "0.05em",
+                  }}>
+                    {hoveredSat.riskLevel}
+                  </span>
+                </>
+              )}
+            </div>
+
+            {/* Satellite name(s) */}
+            {conj ? (
+              <>
+                <div style={{ color: "#e2e8f0", fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
+                  {conj.sat1_name}
+                </div>
+                <div style={{ color: "#64748b", fontSize: 10, marginBottom: 4 }}>
+                  ↕ {conj.distance.toFixed(1)} km
+                </div>
+                <div style={{ color: "#94a3b8", fontSize: 13, fontWeight: 600 }}>
+                  {conj.sat2_name}
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ color: "#22d3ee", fontWeight: 700, fontSize: 13, marginBottom: 4 }}>
+                  {hoveredSat.name}
+                </div>
+                <div style={{ color: "#64748b", fontSize: 10 }}>
+                  NORAD {hoveredSat.norad_id}
+                </div>
+                <div style={{ color: "#475569", fontSize: 10, marginTop: 2 }}>
+                  {hoveredSat.alt?.toFixed(1)} km · {hoveredSat.speed?.toFixed(2)} km/s
+                </div>
+              </>
+            )}
+          </div>
+        );
+      })()}
 
       {/* ── Drag hint ───────────────────────────────────────────────────── */}
       <div
