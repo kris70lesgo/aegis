@@ -46,6 +46,20 @@ def init_db():
         )
     """)
 
+    # Indexes for frequently queried columns
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_satellites_category ON satellites(category)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_satellites_name ON satellites(name)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_conjunctions_risk ON conjunctions(risk)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_conjunctions_distance ON conjunctions(distance)
+    """)
+
     conn.commit()
     conn.close()
     print(f"Database initialised at {DB_PATH}")

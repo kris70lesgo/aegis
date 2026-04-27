@@ -10,6 +10,7 @@ New in Phase 8:
 
 import math
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -144,6 +145,7 @@ def fetch_satellites():
     try:
         result = fetch_and_store()
         _state["last_fetch_at"] = datetime.now(timezone.utc).isoformat()
+        _invalidate_all_caches()
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -248,6 +250,15 @@ def orbit_track(norad_id: str, hours: float = 24, step: int = 60):
 
 # ── Batch positions (parallelised) ────────────────────────────────────────────
 
+# In-memory cache for /positions/all to avoid recomputing SGP4 on every request
+_positions_cache: dict = {
+    "data": None,
+    "timestamp": 0.0,
+    "ttl": 15,  # seconds
+}
+_positions_cache_lock = threading.Lock()
+
+
 def _compute_one(row: dict) -> dict | None:
     pos = get_position(row["tle1"], row["tle2"])
     if pos.get("error"):
@@ -263,13 +274,30 @@ def _compute_one(row: dict) -> dict | None:
     }
 
 
+def _invalidate_positions_cache():
+    """Clear the positions cache — call after TLE fetch or detection runs."""
+    with _positions_cache_lock:
+        _positions_cache["data"] = None
+        _positions_cache["timestamp"] = 0.0
+
+
 @app.get("/positions/all")
 def all_positions(category: str = ""):
     """
     Batch-computes current positions for all satellites in parallel.
     Each SGP4 evaluation runs in its own thread — 8× faster for large fleets.
     Optionally filter by category (e.g. ?category=starlink).
+    Uses a 15-second TTL cache to avoid redundant SGP4 computations.
     """
+    now = time.time()
+
+    # Check cache first (only for unfiltered requests)
+    if not category:
+        with _positions_cache_lock:
+            if (_positions_cache["data"] is not None and
+                    now - _positions_cache["timestamp"] < _positions_cache["ttl"]):
+                return _positions_cache["data"]
+
     conn = get_conn()
     if category:
         rows = [dict(r) for r in conn.execute(
@@ -289,10 +317,49 @@ def all_positions(category: str = ""):
         results = list(pool.map(_compute_one, rows))
 
     sats = [r for r in results if r is not None]
-    return {"count": len(sats), "satellites": sats}
+    response = {"count": len(sats), "satellites": sats}
+
+    # Cache the result for unfiltered requests
+    if not category:
+        with _positions_cache_lock:
+            _positions_cache["data"] = response
+            _positions_cache["timestamp"] = now
+
+    return response
 
 
 # ── Conjunction Detection ─────────────────────────────────────────────────────
+
+# Cache for satellite names (rarely changes, avoids full table scan)
+_sat_names_cache: dict = {"data": None, "count": 0}
+_sat_names_lock = threading.Lock()
+
+
+def _get_sat_names() -> dict:
+    """Get cached satellite name lookup, refreshing only when count changes."""
+    conn = get_conn()
+    current_count = conn.execute("SELECT COUNT(*) FROM satellites").fetchone()[0]
+    conn.close()
+
+    with _sat_names_lock:
+        if _sat_names_cache["data"] is None or _sat_names_cache["count"] != current_count:
+            conn = get_conn()
+            _sat_names_cache["data"] = {
+                r["norad_id"]: r["name"]
+                for r in conn.execute("SELECT norad_id, name FROM satellites").fetchall()
+            }
+            _sat_names_cache["count"] = current_count
+            conn.close()
+        return _sat_names_cache["data"]
+
+
+def _invalidate_all_caches():
+    """Clear all caches — call after TLE fetch or DB changes."""
+    _invalidate_positions_cache()
+    with _sat_names_lock:
+        _sat_names_cache["data"] = None
+        _sat_names_cache["count"] = 0
+
 
 @app.post("/detect")
 def detect_conjunctions(hours: float = 24, step: int = 120, threshold: float = 200.0):
@@ -309,6 +376,7 @@ def detect_conjunctions(hours: float = 24, step: int = 120, threshold: float = 2
     try:
         result = run_detection(hours=hours, step_seconds=step, threshold_km=threshold)
         _state["last_detect_at"] = datetime.now(timezone.utc).isoformat()
+        _invalidate_all_caches()
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -317,11 +385,8 @@ def detect_conjunctions(hours: float = 24, step: int = 120, threshold: float = 2
 @app.get("/conjunctions")
 def get_conjunctions(risk: str = "", limit: int = 100):
     """Stored conjunction events, optionally filtered by risk level (HIGH/MEDIUM/LOW)."""
-    conn      = get_conn()
-    sat_names = {
-        r["norad_id"]: r["name"]
-        for r in conn.execute("SELECT norad_id, name FROM satellites").fetchall()
-    }
+    sat_names = _get_sat_names()
+    conn = get_conn()
 
     if risk:
         rows = conn.execute(
@@ -366,6 +431,15 @@ def _risk_label_prox(d: float) -> str:
     return "LOW"
 
 
+# Cache for proximity results (expensive SGP4 + KD-Tree computation)
+_proximity_cache: dict = {
+    "data": None,
+    "timestamp": 0.0,
+    "ttl": 60,  # seconds
+}
+_proximity_cache_lock = threading.Lock()
+
+
 @app.get("/proximity")
 def get_proximity(limit: int = 200):
     """
@@ -379,7 +453,16 @@ def get_proximity(limit: int = 200):
 
     This endpoint powers the conjunction arc layer on the 3-D globe when no
     formal detection run has been executed.
+    Uses a 60-second TTL cache to avoid redundant SGP4+KDTree computations.
     """
+    now = time.time()
+
+    # Check cache first
+    with _proximity_cache_lock:
+        if (_proximity_cache["data"] is not None and
+                now - _proximity_cache["timestamp"] < _proximity_cache["ttl"]):
+            return _proximity_cache["data"]
+
     conn = get_conn()
     rows = [dict(r) for r in conn.execute(
         "SELECT norad_id, name, tle1, tle2 FROM satellites"
@@ -446,4 +529,11 @@ def get_proximity(limit: int = 200):
     pairs.sort(key=lambda p: p["distance"])
     pairs = pairs[:limit]
 
-    return {"count": len(pairs), "pairs": pairs}
+    response = {"count": len(pairs), "pairs": pairs}
+
+    # Cache the result
+    with _proximity_cache_lock:
+        _proximity_cache["data"] = response
+        _proximity_cache["timestamp"] = now
+
+    return response
