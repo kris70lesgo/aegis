@@ -34,6 +34,12 @@ interface ConjunctionEvent {
   risk: "HIGH" | "MEDIUM" | "LOW";
 }
 
+interface AIConjunctionAnalysis {
+  risk_summary: string;
+  recommendation: string;
+  explanation: string;
+}
+
 interface SystemStatus {
   satellites: number;
   conjunctions: number;
@@ -208,6 +214,11 @@ export default function Home() {
   );
   const [loadingConj, setLoadingConj] = useState(false);
 
+  // AI Analysis
+  const [aiAnalysis, setAiAnalysis] = useState<AIConjunctionAnalysis | null>(null);
+  const [loadingAI, setLoadingAI] = useState(false);
+  const [selectedConj, setSelectedConj] = useState<ConjunctionEvent | null>(null);
+
   // Actions
   const [fetching, setFetching] = useState(false);
   const [detecting, setDetecting] = useState(false);
@@ -267,6 +278,35 @@ export default function Home() {
   useEffect(() => {
     loadConjunctions(riskFilter);
   }, [riskFilter, loadConjunctions]);
+
+  // ── AI Analysis ───────────────────────────────────────────────────────────────
+
+  const fetchAIAnalysis = useCallback(async (conj: ConjunctionEvent) => {
+    setLoadingAI(true);
+    setSelectedConj(conj);
+    setAiAnalysis(null);
+    try {
+      const res = await fetch(`${API}/ai/analyze-conjunction`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sat1: conj.sat1_name,
+          sat2: conj.sat2_name,
+          distance_km: conj.distance,
+          velocity_kms: conj.velocity,
+          tca: conj.tca,
+        }),
+      });
+      if (res.ok) {
+        const d = await res.json();
+        setAiAnalysis(d);
+      }
+    } catch {
+      /* ignore */
+    } finally {
+      setLoadingAI(false);
+    }
+  }, []);
 
   // ── Search ────────────────────────────────────────────────────────────────
 
@@ -881,6 +921,47 @@ export default function Home() {
               )}
             </div>
 
+            {/* AI Insight for conjunction */}
+            {(selectedConj || aiAnalysis) && (
+              <div className="px-5 py-3 border-b border-white/5 bg-purple-950/20">
+                <div className="flex items-center gap-2 mb-2">
+                  <svg
+                    width="12"
+                    height="12"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    className="text-purple-400"
+                  >
+                    <path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1v1a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-1H2a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2Z" />
+                  </svg>
+                  <span className="text-[9px] uppercase tracking-widest text-purple-400">
+                    AI Insight
+                  </span>
+                </div>
+                {loadingAI && !aiAnalysis ? (
+                  <div className="text-[10px] text-zinc-500 animate-pulse">
+                    Analyzing conjunction…
+                  </div>
+                ) : aiAnalysis ? (
+                  <div className="space-y-1.5">
+                    <p className="text-[10px] font-semibold text-zinc-200">
+                      {aiAnalysis.risk_summary}
+                    </p>
+                    <p className="text-[9px] text-zinc-400 leading-snug">
+                      {aiAnalysis.explanation}
+                    </p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-[9px] text-purple-300">
+                        {aiAnalysis.recommendation}
+                      </span>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            )}
+
             {/* Position data */}
             <div className="flex-1 overflow-y-auto px-5 py-4 space-y-5">
               {!position && !posLoading && (
@@ -1113,6 +1194,7 @@ export default function Home() {
                         setSelected({ norad_id: ev.sat1, name: ev.sat1_name, last_updated: "" });
                         setShowSatPanel(true);
                         setShowConjPanel(false);
+                        fetchAIAnalysis(ev);
                       }}
                       className={`rounded-xl border p-3 transition-all hover:brightness-125 cursor-pointer text-left ${s.card}`}
                     >

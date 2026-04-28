@@ -26,6 +26,7 @@ from fetcher import fetch_and_store
 from propagator import get_position, get_orbit_track
 from detector import run_detection
 from propagator import get_position as _get_pos
+from ai_service import analyze_conjunction, summarize_top_risks
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -537,3 +538,49 @@ def get_proximity(limit: int = 200):
         _proximity_cache["timestamp"] = now
 
     return response
+
+
+# ── AI Analysis ─────────────────────────────────────────────────────────────────────
+
+@app.post("/ai/analyze-conjunction")
+def ai_analyze_conjunction(payload: dict):
+    """
+    Analyze a single conjunction event using Gemini AI.
+    Input: {sat1, sat2, distance_km, velocity_kms, tca}
+    Output: {risk_summary, recommendation, explanation}
+    """
+    sat1 = payload.get("sat1", "")
+    sat2 = payload.get("sat2", "")
+    distance_km = float(payload.get("distance_km", 0))
+    velocity_kms = float(payload.get("velocity_kms", 0))
+    tca = payload.get("tca", "")
+
+    if not sat1 or not sat2:
+        raise HTTPException(status_code=400, detail="sat1 and sat2 required")
+
+    return analyze_conjunction(sat1, sat2, distance_km, velocity_kms, tca)
+
+
+@app.get("/ai/summary")
+def ai_summary(limit: int = 10):
+    """
+    Get AI summary of top risk conjunctions from stored events.
+    Returns: {summaries: [{sat_pair, summary}, ...]}
+    """
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT sat1, sat2, distance, risk FROM conjunctions "
+        "ORDER BY distance ASC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return {"summaries": []}
+
+    conjunctions = [
+        {"sat1": r["sat1"], "sat2": r["sat2"], "distance": r["distance"], "risk": r["risk"]}
+        for r in rows
+    ]
+
+    return summarize_top_risks(conjunctions, count=3)
