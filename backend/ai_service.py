@@ -1,8 +1,8 @@
 """
-ai_service.py — Lightweight AI layer for AEGIS using Gemini API
+ai_service.py — Lightweight AI layer for AEGIS using OpenRouter API
 
 Provides:
-  - Single conjunction analysis via Gemini
+  - Single conjunction analysis via OpenRouter (Tencent: Hy3)
   - Summary of top risk conjunctions
   - In-memory cache for AI responses
 """
@@ -12,15 +12,11 @@ import os
 import threading
 from datetime import datetime
 
-from google import genai
+import requests
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.5-flash"
-
-if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-else:
-    client = None
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = "tencent/hy3-preview:free"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 AI_CACHE_TTL = 300  # 5 minutes
 
@@ -54,26 +50,39 @@ def _save_to_cache(key: str, response: dict) -> None:
         }
 
 
-def _call_gemini(prompt: str) -> dict | None:
-    """Call Gemini API and return parsed JSON response."""
-    if not client:
+def _call_ai(prompt: str) -> dict | None:
+    """Call OpenRouter API and return parsed JSON response."""
+    if not OPENROUTER_API_KEY:
+        print("[ai_service] No OPENROUTER_API_KEY set")
         return None
 
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={
-                "temperature": 0.3,
-                "max_output_tokens": 512,
-                "response_mime_type": "application/json",
-            },
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://aegis.space",
+            "X-Title": "AEGIS Satellite Monitor",
+        }
+        payload = {
+            "model": OPENROUTER_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 512,
+        }
+
+        resp = requests.post(
+            OPENROUTER_URL,
+            headers=headers,
+            json=payload,
+            timeout=30,
         )
-        text = response.text
+        resp.raise_for_status()
+        data = resp.json()
+
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         if text:
             import json
             import re
-            # Strip markdown code blocks
             text = text.strip()
             if text.startswith("```json"):
                 text = text[7:]
@@ -82,21 +91,17 @@ def _call_gemini(prompt: str) -> dict | None:
             if text.endswith("```"):
                 text = text[:-3]
             text = text.strip()
-            # Try direct parse first
             try:
                 return json.loads(text)
             except:
-                # Try regex extraction
                 match = re.search(r'\{.+}', text, re.DOTALL)
                 if match:
                     return json.loads(match.group())
         return None
     except Exception as e:
-        print(f"[ai_service] Gemini API error: {e}")
+        print(f"[ai_service] OpenRouter API error: {e}")
         return None
 
-
-# ── Prompt templates ────────────────────────────────────────────────────────────
 
 CONJUNCTION_ANALYSIS_PROMPT = """You are a space situational awareness expert. Analyze this conjunction event and respond ONLY with valid JSON.
 
@@ -128,11 +133,9 @@ Respond with exactly this JSON structure (no extra text):
 }}"""
 
 
-# ── Public API ──────────────────────────────────────────────────────────────────
-
 def analyze_conjunction(sat1: str, sat2: str, distance_km: float, velocity_kms: float, tca: str) -> dict:
     """
-    Analyze a single conjunction event using Gemini.
+    Analyze a single conjunction event using OpenRouter AI.
     Returns: {risk_summary, recommendation, explanation}
     """
     cache_key = _make_cache_key({
@@ -154,7 +157,7 @@ def analyze_conjunction(sat1: str, sat2: str, distance_km: float, velocity_kms: 
         tca=tca,
     )
 
-    result = _call_gemini(prompt)
+    result = _call_ai(prompt)
     if result:
         _save_to_cache(cache_key, result)
         return result
@@ -172,7 +175,7 @@ def summarize_top_risks(conjunctions: list[dict], count: int = 3) -> dict:
     Input: list of conjunction dicts with sat1, sat2, distance, risk
     Returns: {summaries: [{sat_pair, summary}, ...]}
     """
-    if not client or not conjunctions:
+    if not OPENROUTER_API_KEY or not conjunctions:
         return {"summaries": []}
 
     sorted_conjs = sorted(conjunctions, key=lambda x: x.get("distance", 9999))[:count]
@@ -183,7 +186,7 @@ def summarize_top_risks(conjunctions: list[dict], count: int = 3) -> dict:
     )
 
     prompt = SUMMARY_PROMPT.format(count=count, conjunctions=conj_text)
-    result = _call_gemini(prompt)
+    result = _call_ai(prompt)
 
     if result and "summaries" in result:
         return result
