@@ -51,7 +51,7 @@ def _save_to_cache(key: str, response: dict) -> None:
 
 
 def _call_ai(prompt: str) -> dict | None:
-    """Call OpenRouter API and return parsed JSON response."""
+    """Call OpenRouter API and extract structured response from text."""
     if not OPENROUTER_API_KEY:
         print("[ai_service] No OPENROUTER_API_KEY set")
         return None
@@ -79,65 +79,72 @@ def _call_ai(prompt: str) -> dict | None:
         resp.raise_for_status()
         data = resp.json()
 
-        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if text:
-            import json
+        msg = data.get("choices", [{}])[0].get("message", {})
+        text = msg.get("content") or msg.get("reasoning", "") or ""
+        
+        if not text:
+            return None
+        
+        # Extract structured info from the text response
+        text_lower = text.lower()
+        
+        # Determine risk level - look for key phrases in the raw response
+        risk = "low"
+        
+        # Check for explicit high/medium risk mentions - more specific
+        if any(k in text_lower for k in ["high risk", "critical", "severe", "dangerous", "very high risk", "significant collision risk"]):
+            risk = "high"
+        elif any(k in text_lower for k in ["medium risk", "elevated risk", "moderate risk", "concern", "significant approach"]):
+            risk = "medium"
+        else:
+            # Use distance-based inference only for explicit small distances
+            # Look for distance in response (e.g., "0.75 km", "1 km")
             import re
-            text = text.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            elif text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-            try:
-                return json.loads(text)
-            except:
-                match = re.search(r'\{.+}', text, re.DOTALL)
-                if match:
-                    return json.loads(match.group())
-        return None
+            dist_match = re.search(r'(\d+(?:\.\d+)?)\s*km', text_lower)
+            if dist_match:
+                dist = float(dist_match.group(1))
+                if dist < 1:
+                    risk = "high"
+                elif dist < 5:
+                    risk = "medium"
+        
+        # Determine recommendation - look for action keywords
+        rec = "monitor"
+        if any(k in text_lower for k in ["plan maneuver", "evasive", "avoid", "maneuver recommended", "action required"]):
+            rec = "plan maneuver"
+        elif any(k in text_lower for k in ["ignore", "no action", "safe", "dismiss", "no concern"]):
+            rec = "ignore"
+        
+        # Extract explanation - get clean text (first meaningful sentences)
+        # Split by sentences and take first meaningful one
+        sentences = text.replace("\n", " ").split(".")
+        explanation = ""
+        for s in sentences[:3]:  # Take first few fragments
+            if len(s.strip()) > 10:
+                explanation = s.strip()
+                break
+        
+        # Clean common filler
+        bad_starts = ["Got it", "First", "Let me", "I'll", "Here's", "Based on", "Sure", "The user"]
+        for bad in bad_starts:
+            if explanation.startswith(bad):
+                explanation = explanation[len(bad):].strip()
+        
+        if len(explanation) > 80:
+            explanation = explanation[:80].strip() + "."
+        
+        return {
+            "risk_summary": f"{risk.upper()} risk conjunction at miss distance",
+            "recommendation": rec,
+            "explanation": explanation or "Analysis pending"
+        }
     except Exception as e:
         print(f"[ai_service] OpenRouter API error: {e}")
         return None
 
 
-CONJUNCTION_ANALYSIS_PROMPT = """You are a space situational awareness expert. Analyze this conjunction event and respond ONLY with valid JSON.
-
-Data:
-- Satellite 1: {sat1}
-- Satellite 2: {sat2}
-- Miss distance: {distance} km
-- Relative velocity: {velocity} km/s
-- Time of closest approach: {tca}
-
-Respond with exactly this JSON structure (no extra text):
-{{
-  "risk_summary": "1-line summary of collision risk",
-  "recommendation": "monitor | plan maneuver | ignore",
-  "explanation": "2-line max reasoning based ONLY on the data provided"
-}}"""
-
-SUMMARY_PROMPT = """You are a space situational awareness expert. Summarize the top {count} highest-risk conjunctions in simple language.
-
-Conjunctions (sorted by risk):
-{conjunctions}
-
-Respond with exactly this JSON structure (no extra text):
-{{
-  "summaries": [
-    {{"sat_pair": "SAT1-SAT2", "summary": "1-line summary"}},
-    ...
-  ]
-}}"""
-
-
 def analyze_conjunction(sat1: str, sat2: str, distance_km: float, velocity_kms: float, tca: str) -> dict:
-    """
-    Analyze a single conjunction event using OpenRouter AI.
-    Returns: {risk_summary, recommendation, explanation}
-    """
+    """Analyze a single conjunction event using OpenRouter AI."""
     cache_key = _make_cache_key({
         "sat1": sat1,
         "sat2": sat2,
@@ -149,49 +156,60 @@ def analyze_conjunction(sat1: str, sat2: str, distance_km: float, velocity_kms: 
     if cached:
         return cached
 
-    prompt = CONJUNCTION_ANALYSIS_PROMPT.format(
-        sat1=sat1,
-        sat2=sat2,
-        distance=distance_km,
-        velocity=velocity_kms,
-        tca=tca,
-    )
+    prompt = f"""Space conjunction analysis:
+Satellite 1: {sat1}
+Satellite 2: {sat2}
+Miss distance: {distance_km} km
+Relative velocity: {velocity_kms} km/s
+Time of closest approach: {tca}
+
+Classify the risk level and recommend action: monitor, plan maneuver, or ignore?"""
 
     result = _call_ai(prompt)
-    if result:
+    if not result:
+        result = _make_fallback()
+    
+    # Ensure we have a valid response
+    if not result or result.get("risk_summary") == "Analysis unavailable":
+        result = _make_fallback()
+    
+    if result and "risk_summary" in result:
         _save_to_cache(cache_key, result)
-        return result
-
-    return {
-        "risk_summary": "Analysis unavailable",
-        "recommendation": "monitor",
-        "explanation": "AI service temporarily unavailable. Continue monitoring via standard risk assessment.",
-    }
+    
+    return result
 
 
 def summarize_top_risks(conjunctions: list[dict], count: int = 3) -> dict:
-    """
-    Get AI summary of top risk conjunctions.
-    Input: list of conjunction dicts with sat1, sat2, distance, risk
-    Returns: {summaries: [{sat_pair, summary}, ...]}
-    """
+    """Get AI summary of top risk conjunctions."""
     if not OPENROUTER_API_KEY or not conjunctions:
         return {"summaries": []}
 
     sorted_conjs = sorted(conjunctions, key=lambda x: x.get("distance", 9999))[:count]
 
     conj_text = "\n".join(
-        f"- {c.get('sat1', '?')} vs {c.get('sat2', '?')}: {c.get('distance', 0)} km, {c.get('risk', 'LOW')}"
+        f"- {c.get('sat1', '?')} vs {c.get('sat2', '?')}: {c.get('distance', 0):.2f} km ({c.get('risk', 'LOW')})"
         for c in sorted_conjs
     )
 
-    prompt = SUMMARY_PROMPT.format(count=count, conjunctions=conj_text)
+    prompt = f"Rank these {count} close approaches by risk:\n{conj_text}\nWhich 3 need most urgent attention?"
     result = _call_ai(prompt)
-
-    if result and "summaries" in result:
-        return result
-
+    
+    if result:
+        summaries = [{
+            "sat_pair": f"{c.get('sat1', '')}-{c.get('sat2', '')}",
+            "summary": result.get("explanation", "Monitor")[0:50]
+        } for c in sorted_conjs]
+        return {"summaries": summaries}
+    
     return {"summaries": []}
+
+
+def _make_fallback() -> dict:
+    return {
+        "risk_summary": "Analysis unavailable",
+        "recommendation": "monitor",
+        "explanation": "AI service temporarily unavailable. Continue monitoring via standard risk assessment.",
+    }
 
 
 def invalidate_cache() -> None:
