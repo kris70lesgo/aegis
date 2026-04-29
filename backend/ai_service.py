@@ -12,11 +12,15 @@ import os
 import threading
 from datetime import datetime
 
-import requests
+from google import genai
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-1.5-flash-8b"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+GEMINI_MODEL = "gemini-2.5-flash"
+
+if GEMINI_API_KEY:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    client = None
 
 AI_CACHE_TTL = 300  # 5 minutes
 
@@ -52,32 +56,40 @@ def _save_to_cache(key: str, response: dict) -> None:
 
 def _call_gemini(prompt: str) -> dict | None:
     """Call Gemini API and return parsed JSON response."""
-    if not GEMINI_API_KEY:
+    if not client:
         return None
 
-    headers = {
-        "Content-Type": "application/json",
-    }
-    params = {"key": GEMINI_API_KEY}
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 256,
-            "responseMimeType": "application/json",
-        },
-    }
-
     try:
-        resp = requests.post(GEMINI_URL, headers=headers, params=params, json=payload, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-
-        text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config={
+                "temperature": 0.3,
+                "max_output_tokens": 512,
+                "response_mime_type": "application/json",
+            },
+        )
+        text = response.text
         if text:
             import json
-            return json.loads(text)
+            import re
+            # Strip markdown code blocks
+            text = text.strip()
+            if text.startswith("```json"):
+                text = text[7:]
+            elif text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+            # Try direct parse first
+            try:
+                return json.loads(text)
+            except:
+                # Try regex extraction
+                match = re.search(r'\{.+}', text, re.DOTALL)
+                if match:
+                    return json.loads(match.group())
         return None
     except Exception as e:
         print(f"[ai_service] Gemini API error: {e}")
@@ -147,7 +159,6 @@ def analyze_conjunction(sat1: str, sat2: str, distance_km: float, velocity_kms: 
         _save_to_cache(cache_key, result)
         return result
 
-    # Fallback when API fails
     return {
         "risk_summary": "Analysis unavailable",
         "recommendation": "monitor",
@@ -161,10 +172,9 @@ def summarize_top_risks(conjunctions: list[dict], count: int = 3) -> dict:
     Input: list of conjunction dicts with sat1, sat2, distance, risk
     Returns: {summaries: [{sat_pair, summary}, ...]}
     """
-    if not GEMINI_API_KEY or not conjunctions:
+    if not client or not conjunctions:
         return {"summaries": []}
 
-    # Sort by distance (closest = highest risk)
     sorted_conjs = sorted(conjunctions, key=lambda x: x.get("distance", 9999))[:count]
 
     conj_text = "\n".join(
