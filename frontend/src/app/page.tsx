@@ -1221,6 +1221,12 @@ export default function Home() {
                           {ev.velocity.toFixed(2)} km/s
                         </span>
                       </div>
+                      {/* AI quick view - show if already loaded */}
+                      {aiAnalysis && selectedConj && selectedConj.sat1 === ev.sat1 && selectedConj.sat2 === ev.sat2 && (
+                        <div className="mt-2 pt-2 border-t border-purple-500/30">
+                          <span className="text-[8px] text-purple-400 uppercase">AI: {aiAnalysis.recommendation}</span>
+                        </div>
+                      )}
                     </button>
                   );
                 })}
